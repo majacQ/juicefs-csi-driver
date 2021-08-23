@@ -300,8 +300,8 @@ class Pod:
             raise e
         return po.metadata.deletion_timestamp != ""
 
-    def get_log(self):
-        return client.CoreV1Api().read_namespaced_pod_log(self.name, self.namespace)
+    def get_log(self, container_name):
+        return client.CoreV1Api().read_namespaced_pod_log(self.name, self.namespace, container=container_name)
 
 
 def check_mount_point(volume_id, is_static=False):
@@ -399,7 +399,7 @@ def test_deployment_using_storage_rw():
         csi_node_name = os.getenv("JUICEFS_CSI_NODE_POD")
         mount_pod = Pod(name=csi_node_name, deployment_name="", replicas=1, namespace=KUBE_SYSTEM)
         print("get csi node log:")
-        print(mount_pod.get_log())
+        print(mount_pod.get_log("juicefs-plugin"))
         raise Exception("pods of deployment {} are not ready within 5 min.".format(deployment.name))
 
     # check mount point
