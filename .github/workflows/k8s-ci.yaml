@@ -50,6 +50,7 @@ jobs:
         echo "JUICEFS_SECRET_KEY=minioadmin" >> $GITHUB_ENV
         echo "JUICEFS_NAME=csi-ci" >> $GITHUB_ENV
         echo "JUICEFS_TOKEN=$JUICEFS_TOKEN" >> $GITHUB_ENV
+        echo "JUICEFS_META_URL=''" >> $GITHUB_ENV
     - name: Run ee test
       run: |
         cd ${GITHUB_WORKSPACE}/.github/scripts/
