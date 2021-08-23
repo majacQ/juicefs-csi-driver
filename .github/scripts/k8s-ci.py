@@ -6,16 +6,15 @@ import time
 from kubernetes import config, client, watch
 
 KUBE_SYSTEM = "kube-system"
-META_URL = os.getenv("JUICEFS_REDIS_URL") + "/1" if os.getenv("JUICEFS_REDIS_URL") is not None \
-                                                    and os.getenv("JUICEFS_REDIS_URL") != "" else ""
-ACCESS_KEY = os.getenv("JUICEFS_ACCESS_KEY")
-SECRET_KEY = os.getenv("JUICEFS_SECRET_KEY")
-STORAGE = os.getenv("JUICEFS_STORAGE")
-BUCKET = os.getenv("JUICEFS_BUCKET")
+META_URL = os.getenv("JUICEFS_META_URL") or ""
+ACCESS_KEY = os.getenv("JUICEFS_ACCESS_KEY") or ""
+SECRET_KEY = os.getenv("JUICEFS_SECRET_KEY") or ""
+STORAGE = os.getenv("JUICEFS_STORAGE") or ""
+BUCKET = os.getenv("JUICEFS_BUCKET") or ""
 TOKEN = os.getenv("JUICEFS_TOKEN")
 RESOURCE_PREFIX = "ce-" if TOKEN is None else "ee-"
 
-SECRET_NAME = "ce-juicefs-secret" if os.getenv("JUICEFS_NAME") is None else os.getenv("JUICEFS_NAME")
+SECRET_NAME = os.getenv("JUICEFS_NAME") or "ce-juicefs-secret"
 STORAGECLASS_NAME = "ce-juicefs-sc" if TOKEN is None else "ee-juicefs-sc"
 SECRETs = []
 STORAGECLASSs = []
@@ -48,7 +47,7 @@ class Secret:
         else:
             data = {
                 "name": base64.b64encode(self.secret_name.encode('utf-8')).decode("utf-8"),
-                "token": self.token,
+                "token": base64.b64encode(self.token.encode('utf-8')).decode("utf-8"),
                 "accesskey": base64.b64encode(self.access_key.encode('utf-8')).decode("utf-8"),
                 "secretkey": base64.b64encode(self.secret_key.encode('utf-8')).decode("utf-8"),
                 "storage": base64.b64encode(self.storage_name.encode('utf-8')).decode("utf-8"),
@@ -308,11 +307,11 @@ def check_mount_point(volume_id, is_static=False):
         subprocess.run(["sudo", "juicefs", "mount", "-d", META_URL, "/jfs"])
     else:
         subprocess.run(
-            ["sudo", "/usr/bin/juicefs", "auth", SECRET_NAME, "--token", base64.b64decode(TOKEN.encode("utf-8")),
+            ["sudo", "/usr/bin/juicefs", "auth", SECRET_NAME, "--token", TOKEN,
              "--accesskey", ACCESS_KEY, "--secretkey", SECRET_KEY, "--bucket", BUCKET, SECRET_NAME])
         subprocess.run(["sudo", "/usr/bin/juicefs", "mount", "-d", SECRET_NAME, "/jfs"])
 
-    check_path = "/jfs/{}/out.txt".format(volume_id) if not is_static else "/jfs/out.txt"
+    check_path = f"/jfs/{}/out.txt".format(volume_id) if not is_static else "/jfs/out.txt"
     for i in range(0, 60):
         try:
             f = open(check_path)
@@ -320,8 +319,8 @@ def check_mount_point(volume_id, is_static=False):
             print("Can't find file: {}".format(check_path))
             time.sleep(5)
             continue
-        context = f.read(1)
-        if context is not None and context != "":
+        content = f.read(1)
+        if content is not None and content != "":
             f.close()
             print("umount /jfs.")
             subprocess.run(["sudo", "umount", "/jfs"])
@@ -396,13 +395,13 @@ def test_deployment_using_storage_rw():
     if not result:
         raise Exception("pods of deployment {} are not ready within 5 min.".format(deployment.name))
 
-    # # check mount point
-    # print("check mount point..")
-    # volume_id = pvc.get_volume_id()
-    # print("get volume_id {}".format(volume_id))
-    # result = check_mount_point(volume_id)
-    # if not result:
-    #     raise Exception("mount point of /jfs/{}/out.txt are not ready within 5 min.".format(volume_id))
+    # check mount point
+    print("check mount point..")
+    volume_id = pvc.get_volume_id()
+    print("get volume_id {}".format(volume_id))
+    result = check_mount_point(volume_id)
+    if not result:
+        raise Exception("mount point of /jfs/{}/out.txt are not ready within 5 min.".format(volume_id))
     print("test pass.")
     return
 
@@ -584,10 +583,10 @@ if __name__ == "__main__":
     try:
         deploy_secret_and_sc()
         test_deployment_using_storage_rw()
-        test_deployment_using_storage_ro()
-        test_deployment_use_pv_rw()
-        test_deployment_use_pv_ro()
-        test_delete_one()
-        test_delete_all()
+        # test_deployment_using_storage_ro()
+        # test_deployment_use_pv_rw()
+        # test_deployment_use_pv_ro()
+        # test_delete_one()
+        # test_delete_all()
     finally:
         tear_down()
