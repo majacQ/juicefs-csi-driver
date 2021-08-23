@@ -307,8 +307,8 @@ def check_mount_point(volume_id, is_static=False):
         subprocess.run(["sudo", "juicefs", "mount", "-d", META_URL, "/jfs"])
     else:
         subprocess.run(
-            ["sudo", "/usr/bin/juicefs", "auth", SECRET_NAME, "--token", TOKEN,
-             "--accesskey", ACCESS_KEY, "--secretkey", SECRET_KEY, "--bucket", BUCKET, SECRET_NAME])
+            ["sudo", "/usr/bin/juicefs", "auth", f"--token={TOKEN}", f"--accesskey={ACCESS_KEY}",
+             f"--secretkey={SECRET_KEY}", f"--bucket={BUCKET}", SECRET_NAME])
         subprocess.run(["sudo", "/usr/bin/juicefs", "mount", "-d", SECRET_NAME, "/jfs"])
 
     check_path = f"/jfs/{volume_id}/out.txt" if not is_static else "/jfs/out.txt"
