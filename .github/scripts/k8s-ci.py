@@ -396,12 +396,9 @@ def test_deployment_using_storage_rw():
     print("watch for pods of {} for success.".format(deployment.name))
     result = pod.watch_for_success()
     if not result:
-        volume_id = pvc.get_volume_id()
-        print("get volume_id {}".format(volume_id))
-        mount_pod_name = get_mount_pod_name(volume_id)
-        print("mount pod name: {}".format(mount_pod_name))
-        mount_pod = Pod(name=mount_pod_name, deployment_name="", replicas=1, namespace=KUBE_SYSTEM)
-        print("get mount pod log:")
+        csi_node_name = os.getenv("JUICEFS_CSI_NODE_POD")
+        mount_pod = Pod(name=csi_node_name, deployment_name="", replicas=1, namespace=KUBE_SYSTEM)
+        print("get csi node log:")
         print(mount_pod.get_log())
         raise Exception("pods of deployment {} are not ready within 5 min.".format(deployment.name))
 
