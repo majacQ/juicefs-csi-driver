@@ -225,6 +225,11 @@ class Deployment:
         client.AppsV1Api().delete_namespaced_deployment(name=self.name, namespace=self.namespace)
         DEPLOYMENTs.remove(self)
 
+    def refresh(self):
+        deploy = client.AppsV1Api().read_namespaced_deployment(name=self.name, namespace=self.namespace)
+        self.replicas = deploy.spec.replicas
+        return self
+
 
 class Pod:
     def __init__(self, name, deployment_name, replicas, namespace="default"):
@@ -313,10 +318,11 @@ def check_mount_point(volume_id, is_static=False):
             ["sudo", "/usr/bin/juicefs", "auth", f"--token={TOKEN}", f"--accesskey={ACCESS_KEY}",
              f"--secretkey={SECRET_KEY}", f"--bucket={BUCKET}", SECRET_NAME])
         subprocess.run(["sudo", "/usr/bin/juicefs", "mount", "-d", SECRET_NAME, "/jfs"])
-
+    print("mount success.")
     check_path = f"/jfs/{volume_id}/out.txt" if not is_static else "/jfs/out.txt"
     for i in range(0, 60):
         try:
+            print("open file {}".format(check_path))
             f = open(check_path)
         except FileNotFoundError:
             print("Can't find file: {}".format(check_path))
@@ -365,19 +371,32 @@ def deploy_secret_and_sc():
 
 
 def tear_down():
+    print("Tear down all resources begin..")
     try:
-        for secret in SECRETs:
-            secret.delete()
+        for deploy in DEPLOYMENTs:
+            print("Delete deployment {}".format(deploy.name))
+            deploy = deploy.refresh()
+            deploy.delete()
+            pod = Pod(name="", deployment_name=deploy.name, replicas=deploy.replicas)
+            print("Watch for pods of deployment {} for delete.".format(deploy.name))
+            result = pod.watch_for_delete(deploy.replicas)
+            if not result:
+                raise Exception("Pods of deployment {} are not delete within 5 min.".format(deploy.name))
         for pvc in PVCs:
+            print(f"Delete pvc {pvc}")
             pvc.delete()
         for sc in STORAGECLASSs:
+            print(f"Delete storageclass {sc}")
             sc.delete()
         for pv in PVs:
+            print(f"Delete pv {pv}")
             pv.delete()
-        for deploy in DEPLOYMENTs:
-            deploy.delete()
+        for secret in SECRETs:
+            print(f"Delete secret {secret}")
+            secret.delete()
     except Exception as e:
-        print("error in tear down: {}".format(e))
+        print("Error in tear down: {}".format(e))
+    print("Tear down success.")
 
 
 ###### test case in ci ######
