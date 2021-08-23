@@ -419,6 +419,8 @@ def test_deployment_using_storage_rw():
         mount_pod = Pod(name=csi_node_name, deployment_name="", replicas=1, namespace=KUBE_SYSTEM)
         print("get csi node log:")
         print(mount_pod.get_log("juicefs-plugin"))
+        print("get event: ")
+        print(client.CoreV1Api().list_namespaced_event(namespace=KUBE_SYSTEM))
         raise Exception("pods of deployment {} are not ready within 5 min.".format(deployment.name))
 
     # check mount point
