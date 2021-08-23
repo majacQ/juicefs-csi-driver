@@ -300,6 +300,9 @@ class Pod:
             raise e
         return po.metadata.deletion_timestamp != ""
 
+    def get_log(self):
+        return client.CoreV1Api().read_namespaced_pod_log(self.name, self.namespace)
+
 
 def check_mount_point(volume_id, is_static=False):
     print("mount /jfs.")
@@ -393,6 +396,13 @@ def test_deployment_using_storage_rw():
     print("watch for pods of {} for success.".format(deployment.name))
     result = pod.watch_for_success()
     if not result:
+        volume_id = pvc.get_volume_id()
+        print("get volume_id {}".format(volume_id))
+        mount_pod_name = get_mount_pod_name(volume_id)
+        print("mount pod name: {}".format(mount_pod_name))
+        mount_pod = Pod(name=mount_pod_name, deployment_name="", replicas=1, namespace=KUBE_SYSTEM)
+        print("get mount pod log:")
+        print(mount_pod.get_log())
         raise Exception("pods of deployment {} are not ready within 5 min.".format(deployment.name))
 
     # check mount point
