@@ -6,8 +6,7 @@ import time
 from kubernetes import config, client, watch
 
 KUBE_SYSTEM = "kube-system"
-META_URL = os.getenv("JUICEFS_REDIS_URL") + "/1" if os.getenv("JUICEFS_REDIS_URL") is not None \
-                                                    and os.getenv("JUICEFS_REDIS_URL") != "" else ""
+META_URL = os.getenv("JUICEFS_REDIS_URL") + "/1" if os.getenv("JUICEFS_REDIS_URL") else ""
 ACCESS_KEY = os.getenv("JUICEFS_ACCESS_KEY")
 SECRET_KEY = os.getenv("JUICEFS_SECRET_KEY")
 STORAGE = os.getenv("JUICEFS_STORAGE")
@@ -15,7 +14,7 @@ BUCKET = os.getenv("JUICEFS_BUCKET")
 TOKEN = os.getenv("JUICEFS_TOKEN")
 RESOURCE_PREFIX = "ce-" if TOKEN is None else "ee-"
 
-SECRET_NAME = "ce-juicefs-secret" if os.getenv("JUICEFS_NAME") is None else os.getenv("JUICEFS_NAME")
+SECRET_NAME = os.getenv("JUICEFS_NAME") or "ce-juicefs-secret"
 STORAGECLASS_NAME = "ce-juicefs-sc" if TOKEN is None else "ee-juicefs-sc"
 SECRETs = []
 STORAGECLASSs = []
