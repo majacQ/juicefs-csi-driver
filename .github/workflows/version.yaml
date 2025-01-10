@@ -1,42 +1,93 @@
 name: version
 
 on:
-  push:
-    branches:
-      - release*
+  workflow_dispatch:
+    inputs:
+      ce_juicefs_build_version:
+        description: 'ce juicefs version for image build'
+        required: false
+        type: string
+      ee_juicefs_latest_tag:
+        description: 'ee juicefs latest tag (without ee-) of mount image in csi image'
+        required: false
+        type: string
+      csi_build_version:
+        description: 'csi version for image build'
+        required: false
+        type: string
   release:
     types:
       - created
 
 jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Set up Go 1.14.x
-        uses: actions/setup-go@v2
-        with:
-          go-version: "1.14.x"
-      - name: Check out code into the Go module directory
-        uses: actions/checkout@v2
-      - name: Build
-        run: make
-      - name: Verify
-        run: make verify
-      - name: Test
-        run: make test
-      - name: Test sanity
-        run: make test-sanity
-
   publish-version:
-    needs: test
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v2
-    - name: Build docker image
-      run: make image-version
+    - uses: pnpm/action-setup@v4
+      name: Install pnpm
+      with:
+        version: 9
+        run_install: |
+          cwd: dashboard-ui-v2
+    - name: Build dashboard
+      run: make dashboard-dist
     - name: Login Docker Hub
-      run: docker login --username juicefs --password ${PASSWORD}
+      run: docker login --username chnliyong --password ${PASSWORD}
       env:
-        PASSWORD: ${{ secrets.DOCKERHUB_ACCESS_TOKEN }}
-    - name: Push docker image
-      run: make push-version
+        PASSWORD: ${{ secrets.DOCKERHUB_FUSE_ACCESS_TOKEN }}
+    - name: Confirm juicefs version
+      env:
+        JUICEFS_BUILD_VERSION: ${{ inputs.ce_juicefs_build_version }}
+        EE_JUICEFS_LATEST_VERSION: ${{ inputs.ee_juicefs_latest_tag }}
+        CSI_BUILD_VERSION: ${{ inputs.csi_build_version }}
+      run: |
+        if [ ${{ env.JUICEFS_BUILD_VERSION }} ]; then
+          echo "JUICEFS_CE_LATEST_VERSION=${{ env.JUICEFS_BUILD_VERSION }}" >> $GITHUB_ENV
+        else
+          JUICEFS_CE_LATEST_VERSION=$(curl -fsSL https://api.github.com/repos/juicedata/juicefs/releases/latest | grep tag_name | grep -oE 'v[0-9]+\.[0-9][0-9]*(\.[0-9]+(-[0-9a-z]+)?)?')
+          echo "JUICEFS_CE_LATEST_VERSION=$JUICEFS_CE_LATEST_VERSION" >> $GITHUB_ENV
+        fi
+        
+        if [ ${{ env.EE_JUICEFS_LATEST_VERSION }} ]; then
+          echo "JUICEFS_EE_LATEST_VERSION=${{ env.EE_JUICEFS_LATEST_VERSION }}" >> $GITHUB_ENV
+        else
+          curl -sSL https://static.juicefs.com/release/bin_pkgs/latest_stable_full.tar.gz | tar -xz
+          version=$(grep -oP 'mount_version=\K.*' version.ini)
+          hash=$(./Linux/mount version | awk -F '[()]' '{print $2}' | awk '{print $NF}')
+          JUICEFS_EE_LATEST_VERSION=$version-$hash
+          echo "JUICEFS_EE_LATEST_VERSION=$JUICEFS_EE_LATEST_VERSION" >> $GITHUB_ENV
+        fi
+        
+        if [ ${{ env.CSI_BUILD_VERSION }} ]; then
+          echo "CSI_LATEST_VERSION=${{ env.CSI_BUILD_VERSION }}" >> $GITHUB_ENV
+        else
+          CSI_LATEST_VERSION=$(git describe --tags --match 'v*' | grep -oE 'v[0-9]+\.[0-9][0-9]*(\.[0-9]+)?')
+          echo "CSI_LATEST_VERSION=$CSI_LATEST_VERSION" >> $GITHUB_ENV
+        fi
+    - name: Build docker images and push
+      env:
+        CEVERSION: ce-${{ env.JUICEFS_CE_LATEST_VERSION }}
+        CEJUICEFS_VERSION: ${{ env.JUICEFS_CE_LATEST_VERSION }}
+        EEVERSION: ee-${{ env.JUICEFS_EE_LATEST_VERSION }}
+        CSIVERSION: ${{ env.CSI_LATEST_VERSION }}
+        DASHBOARD_TAG: ${{ env.CSI_LATEST_VERSION }}
+        JUICEFS_CSI_REPO_REF: ${{ github.ref }}
+      run: |
+        export DOCKER_CLI_EXPERIMENTAL=enabled
+        docker run --privileged --rm tonistiigi/binfmt:qemu-v6.2.0 --uninstall qemu-*
+        docker run --privileged --rm tonistiigi/binfmt:qemu-v6.2.0 --install all
+        docker buildx create --use --name mybuilder
+        make -C docker image-version
+        make -C docker dashboard-buildx
+    - name: sync image
+      env:
+        ACR_TOKEN: ${{ secrets.ACR_TOKEN }}
+        ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
+      run: |
+        cd ${GITHUB_WORKSPACE}/.github/scripts/
+        ./sync.sh csi-driver ${{ env.CSI_LATEST_VERSION }}
+    - name: Setup upterm session
+      if: ${{ failure() }}
+      timeout-minutes: 60
+      uses: lhotari/action-upterm@v1

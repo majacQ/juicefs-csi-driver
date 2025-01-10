@@ -17,11 +17,18 @@ limitations under the License.
 package driver
 
 import (
+	"k8s.io/client-go/kubernetes/fake"
+
+	"github.com/juicedata/juicefs-csi-driver/pkg/config"
 	"github.com/juicedata/juicefs-csi-driver/pkg/juicefs"
+	"github.com/juicedata/juicefs-csi-driver/pkg/k8sclient"
+	"github.com/juicedata/juicefs-csi-driver/pkg/util"
 )
 
 // NewFakeDriver creates a new mock driver used for testing
 func NewFakeDriver(endpoint string, fakeProvider juicefs.Interface) *Driver {
+	registerer, _ := util.NewPrometheus(config.NodeName)
+	metrics := newNodeMetrics(registerer)
 	return &Driver{
 		endpoint: endpoint,
 		controllerService: controllerService{
@@ -31,7 +38,8 @@ func NewFakeDriver(endpoint string, fakeProvider juicefs.Interface) *Driver {
 		nodeService: nodeService{
 			juicefs:   fakeProvider,
 			nodeID:    "fake-node-id",
-			k8sClient: juicefs.FakeClient,
+			k8sClient: &k8sclient.K8sClient{Interface: fake.NewSimpleClientset()},
+			metrics:   metrics,
 		},
 	}
 }
