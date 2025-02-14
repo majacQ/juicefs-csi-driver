@@ -18,49 +18,166 @@ package controller
 
 import (
 	"context"
-	"github.com/juicedata/juicefs-csi-driver/pkg/juicefs"
-	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/klog"
-	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"golang.org/x/sync/errgroup"
+	"k8s.io/client-go/util/flowcontrol"
+	"k8s.io/klog/v2"
+	k8sexec "k8s.io/utils/exec"
+	"k8s.io/utils/mount"
+
+	"github.com/juicedata/juicefs-csi-driver/pkg/common"
+	"github.com/juicedata/juicefs-csi-driver/pkg/config"
+	"github.com/juicedata/juicefs-csi-driver/pkg/k8sclient"
+)
+
+const (
+	retryPeriod    = 5 * time.Second
+	maxRetryPeriod = 60 * time.Second
+)
+
+var (
+	reconcilerLog = klog.NewKlogr().WithName("reconciler-controller")
 )
 
 type PodReconciler struct {
-	client.Client
+	mount.SafeFormatAndMount
+	*k8sclient.K8sClient
 }
 
-func (p PodReconciler) Reconcile(ctx context.Context, request reconcile.Request) (reconcile.Result, error) {
-	klog.V(6).Infof("Receive event. name: %s, namespace: %s", request.Name, request.Namespace)
-
-	// fetch pod
-	pod := &corev1.Pod{}
-	requeue, err := p.fetchPod(ctx, request.NamespacedName, pod)
-	if err != nil || requeue {
-		return ctrl.Result{}, err
+func StartReconciler() error {
+	// gen kubelet client
+	port, err := strconv.Atoi(config.KubeletPort)
+	if err != nil {
+		return err
+	}
+	kc, err := k8sclient.NewKubeletClient(config.HostIp, port)
+	if err != nil {
+		return err
 	}
 
-	// check label
-	if value, ok := pod.Labels[juicefs.PodTypeKey]; !ok || value != juicefs.PodTypeValue {
-		klog.V(6).Infof("Pod %s is not JuiceFS mount pod. ignore.", pod.Name)
-		return reconcile.Result{Requeue: true}, nil
+	// check if kubelet can be connected
+	err = kc.Access()
+	if err != nil {
+		return err
 	}
 
-	// check nodeName
-	if pod.Spec.NodeName != juicefs.NodeName {
-		klog.V(6).Infof("Pod %s is not this node: %s. ignore.", pod.Name, juicefs.NodeName)
-		return reconcile.Result{Requeue: true}, nil
+	// gen podDriver
+	k8sClient, err := k8sclient.NewClient()
+	if err != nil {
+		reconcilerLog.Error(err, "Could not create k8s client")
+		return err
 	}
 
-	podDriver := NewPodDriver(p.Client)
-	return podDriver.Run(ctx, pod)
+	go doReconcile(k8sClient, kc)
+	return nil
 }
 
-func (p *PodReconciler) fetchPod(ctx context.Context, name types.NamespacedName, pod *corev1.Pod) (bool, error) {
-	if err := p.Get(ctx, name, pod); err != nil {
-		klog.V(6).Infof("Get pod namespace %s name %s failed: %v", name.Namespace, name.Name, err)
-		return true, err
+type PodStatus struct {
+	podStatus
+	syncAt     time.Time
+	nextSyncAt time.Time
+}
+
+func doReconcile(ks *k8sclient.K8sClient, kc *k8sclient.KubeletClient) {
+	backOff := flowcontrol.NewBackOff(retryPeriod, maxRetryPeriod)
+	lastPodStatus := make(map[string]PodStatus)
+	statusMu := sync.Mutex{}
+	mounter := mount.SafeFormatAndMount{
+		Interface: mount.New(""),
+		Exec:      k8sexec.New(),
 	}
-	return false, nil
+	for {
+		timeoutCtx, cancel := context.WithTimeout(context.Background(), config.ReconcileTimeout)
+		g, ctx := errgroup.WithContext(timeoutCtx)
+
+		mit := newMountInfoTable()
+		podList, err := kc.GetNodeRunningPods()
+		if err != nil {
+			reconcilerLog.Error(err, "doReconcile GetNodeRunningPods error")
+			cancel()
+			time.Sleep(time.Duration(config.ReconcilerInterval) * time.Second)
+			continue
+		}
+		podDriver := NewPodDriver(ks, mounter, podList)
+		podDriver.SetMountInfo(*mit)
+
+		for i := range podList.Items {
+			pod := &podList.Items[i]
+			if pod.Namespace != config.Namespace {
+				continue
+			}
+			// check label
+			if value, ok := pod.Labels[common.PodTypeKey]; !ok || value != common.PodTypeValue {
+				continue
+			}
+			crtPodStatus := getPodStatus(pod)
+			statusMu.Lock()
+			lastStatus, ok := lastPodStatus[pod.Name]
+			statusMu.Unlock()
+			if ok {
+				if lastStatus.podStatus == crtPodStatus && time.Now().Before(lastStatus.nextSyncAt) {
+					// skipped
+					continue
+				}
+			}
+
+			backOffID := "mountpod" // all pods share the same backoffID
+			if backOff.IsInBackOffSinceUpdate(backOffID, backOff.Clock.Now()) {
+				reconcilerLog.V(1).Info("in backoff, retry later", "name", pod.Name)
+				continue
+			}
+			g.Go(func() error {
+				errChan := make(chan error, 1)
+				go func() {
+					defer close(errChan)
+					defer func() {
+						statusMu.Lock()
+						lastStatus.podStatus = crtPodStatus
+						lastPodStatus[pod.Name] = lastStatus
+						statusMu.Unlock()
+					}()
+					result, err := podDriver.Run(ctx, pod)
+					lastStatus.syncAt = time.Now()
+					if err != nil {
+						reconcilerLog.Error(err, "Driver check pod error, will retry", "name", pod.Name)
+						if strings.Contains(err.Error(), "client rate limiter Wait returned an error") {
+							reconcilerLog.V(1).Info("client rate limit")
+							backOff.Next(backOffID, time.Now())
+						} else {
+							backOff.Reset(backOffID)
+						}
+						lastStatus.nextSyncAt = time.Now()
+						errChan <- err
+						return
+					}
+					backOff.Reset(backOffID)
+					if result.RequeueImmediately {
+						lastStatus.nextSyncAt = time.Now()
+					} else if result.RequeueAfter > 0 {
+						lastStatus.nextSyncAt = time.Now().Add(result.RequeueAfter)
+					} else {
+						lastStatus.nextSyncAt = time.Now().Add(10 * time.Minute)
+					}
+				}()
+
+				select {
+				case <-ctx.Done():
+					reconcilerLog.Info("goroutine of pod cancel", "name", pod.Name)
+					return nil
+				case err := <-errChan:
+					return err
+				}
+			})
+		}
+		backOff.GC()
+		_ = g.Wait()
+		podList = nil
+
+		cancel()
+		time.Sleep(time.Duration(config.ReconcilerInterval) * time.Second)
+	}
 }

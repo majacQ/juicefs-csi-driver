@@ -1,0 +1,228 @@
+name: build juicefs image
+
+on:
+  workflow_dispatch:
+    inputs:
+      ce_juicefs_build_version:
+        description: 'ce juicefs version for image build'
+        required: false
+        type: string
+      ee_pkg_url:
+        description: 'ee juicefs pkg url for image build'
+        required: false
+        type: string
+  schedule:
+    - cron: "0 0 * * *"
+
+jobs:
+  publish-ce-mount-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - name: Login Docker Hub
+        env:
+          PASSWORD: ${{ secrets.DOCKERHUB_FUSE_ACCESS_TOKEN }}
+        run: docker login --username chnliyong --password ${PASSWORD}
+      - name: check latest tag
+        continue-on-error: true
+        env:
+          JUICEFS_BUILD_VERSION: ${{ inputs.ce_juicefs_build_version }}
+        run: |
+          set +e
+          if [ ${{ env.JUICEFS_BUILD_VERSION }} ]; then
+            echo "JUICEFS_CE_LATEST_VERSION=${{ env.JUICEFS_BUILD_VERSION }}" >> $GITHUB_ENV
+            echo "MOUNT_IMAGE_EXIST=false" >> $GITHUB_ENV
+          else
+            JUICEFS_CE_LATEST_VERSION=$(curl -fsSL https://api.github.com/repos/juicedata/juicefs/releases/latest | grep tag_name | grep -oE 'v[0-9]+\.[0-9][0-9]*(\.[0-9]+(-[0-9a-z]+)?)?')
+            if [ -z "$JUICEFS_CE_LATEST_VERSION" ]; then
+              echo "Failed to get juicefs ce version"
+              exit 1
+            fi
+            echo "JUICEFS_CE_LATEST_VERSION=$JUICEFS_CE_LATEST_VERSION" >> $GITHUB_ENV
+
+            echo "mount image is juicedata/mount:ce-${JUICEFS_CE_LATEST_VERSION}"
+            echo "MOUNT_IMAGE_EXIST=false" >> $GITHUB_ENV
+            docker pull juicedata/mount:ce-${JUICEFS_CE_LATEST_VERSION}
+            rst=$?
+            if [ $rst -eq 0 ]; then
+              echo "MOUNT_IMAGE_EXIST=true" >> $GITHUB_ENV
+            fi
+          fi
+      - name: Build and Push juicefs latest image
+        env:
+          CEVERSION: latest
+          ACR_TOKEN: ${{ secrets.ACR_TOKEN }}
+          ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
+        run: |
+          image_exist=${{ env.MOUNT_IMAGE_EXIST }}
+          if [ $image_exist == "false" ]; then
+            if [[ ${JUICEFS_CE_LATEST_VERSION:0:4} != "v1.1" ]]; then
+              echo "Build JuiceFS latest image"
+              export CEJUICEFS_VERSION=${JUICEFS_CE_LATEST_VERSION}
+              make -C docker ce-image
+              ${GITHUB_WORKSPACE}/.github/scripts/sync.sh mount
+            fi
+          else
+            echo "JuiceFS latest image already exists"
+          fi
+      - name: Build juicefs image
+        env:
+          CEVERSION: ce-${{ env.JUICEFS_CE_LATEST_VERSION }}
+          IMAGE_TAG: ce-${{ env.JUICEFS_CE_LATEST_VERSION }}
+          CEJUICEFS_VERSION: ${{ env.JUICEFS_CE_LATEST_VERSION }}
+          ACR_TOKEN: ${{ secrets.ACR_TOKEN }}
+          ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
+        run: |
+          mount_image_exist=${{ env.MOUNT_IMAGE_EXIST }}
+          export DOCKER_CLI_EXPERIMENTAL=enabled
+          docker run --rm --privileged docker/binfmt:66f9012c56a8316f9244ffd7622d7c21c1f6f28d
+          docker buildx create --use --name mybuilder
+          if [ $mount_image_exist == "false" ]; then
+            echo "Build JuiceFS new version image: $JUICEFS_CE_LATEST_VERSION"
+            if [[ ${JUICEFS_CE_LATEST_VERSION:0:4} == "v1.1" ]]; then
+              make -C docker ce-image-1.1-buildx
+            else
+              make -C docker ce-image-buildx
+            fi
+          else
+            echo "JuiceFS mount ce version image $JUICEFS_CE_LATEST_VERSION already exists"
+          fi
+      - name: sync image
+        env:
+          IMAGE_TAG: ce-${{ env.JUICEFS_CE_LATEST_VERSION }}
+          ACR_TOKEN: ${{ secrets.ACR_TOKEN }}
+          ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
+        run: |
+          cd ${GITHUB_WORKSPACE}/.github/scripts/
+          ./sync.sh mount ${{ env.IMAGE_TAG }}
+      - name: Setup upterm session
+        if: ${{ failure() }}
+        timeout-minutes: 60
+        uses: lhotari/action-upterm@v1
+
+  publish-ee-4_0-mount-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - name: Login Docker Hub
+        env:
+          PASSWORD: ${{ secrets.DOCKERHUB_FUSE_ACCESS_TOKEN }}
+        run: docker login --username chnliyong --password ${PASSWORD}
+      - name: check latest tag
+        continue-on-error: true
+        run: |
+          set +e
+          JUICEFS_EE_LATEST_VERSION=$(curl -sSL https://juicefs.com/static/Linux/mount.4.9 -o juicefs-ee && chmod +x juicefs-ee && ./juicefs-ee -V | cut -d' ' -f3)
+          if [ -z "$JUICEFS_EE_LATEST_VERSION" ]; then
+            echo "Failed to get juicefs ee version"
+            exit 1
+          fi
+          echo "JUICEFS_EE_LATEST_VERSION=$JUICEFS_EE_LATEST_VERSION" >> $GITHUB_ENV
+
+          echo "mount image is juicedata/mount:ee-$JUICEFS_EE_LATEST_VERSION"
+          echo "MOUNT_IMAGE_EXIST=false" >> $GITHUB_ENV
+          docker pull juicedata/mount:ee-$JUICEFS_EE_LATEST_VERSION
+          rst=$?
+          if [ $rst -eq 0 ]; then
+            echo "MOUNT_IMAGE_EXIST=true" >> $GITHUB_ENV
+          fi
+      - name: Buildx and Push juicefs image
+        env:
+          EEVERSION: ee-${{ env.JUICEFS_EE_LATEST_VERSION }}
+          IMAGE_TAG: ee-${{ env.JUICEFS_EE_LATEST_VERSION }}
+          ACR_TOKEN: ${{ secrets.ACR_TOKEN }}
+          ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
+        run: |
+          mount_image_exist=${{ env.MOUNT_IMAGE_EXIST }}
+          export DOCKER_CLI_EXPERIMENTAL=enabled
+          docker run --rm --privileged docker/binfmt:66f9012c56a8316f9244ffd7622d7c21c1f6f28d
+          docker buildx create --use --name mybuilder
+
+          if [ $mount_image_exist == "false" ]; then
+            echo "Build JuiceFS new version image"
+            make -C docker ee-image-4.0-buildx
+          else
+            echo "JuiceFS mount ee version image already exists"
+          fi
+
+      - name: sync image
+        env:
+          IMAGE_TAG: ee-${{ env.JUICEFS_EE_LATEST_VERSION }}
+          ACR_TOKEN: ${{ secrets.ACR_TOKEN }}
+          ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
+        run: |
+          cd ${GITHUB_WORKSPACE}/.github/scripts/
+          ./sync.sh mount ${{ env.IMAGE_TAG }}
+      - name: Setup upterm session
+        if: ${{ failure() }}
+        timeout-minutes: 60
+        uses: lhotari/action-upterm@v1
+
+  publish-ee-5_0-mount-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - name: Login Docker Hub
+        env:
+          PASSWORD: ${{ secrets.DOCKERHUB_FUSE_ACCESS_TOKEN }}
+        run: docker login --username chnliyong --password ${PASSWORD}
+      - name: check latest tag
+        continue-on-error: true
+        env:
+          ee_pkg_url: ${{ inputs.ee_pkg_url }}
+        run: |
+          set +e
+          url=${{ env.ee_pkg_url }}
+          if [ -z "$ee_pkg_url" ]; then
+            url="https://static.juicefs.com/release/bin_pkgs/latest_stable_full.tar.gz"
+          fi
+          curl -sSL $url | tar -xz
+          version=$(grep -oP 'mount_version=\K.*' version.ini)
+          hash=$(./Linux/mount version | awk -F '[()]' '{print $2}' | awk '{print $NF}')
+          JUICEFS_EE_LATEST_VERSION=$version-$hash
+          if [ -z "$JUICEFS_EE_LATEST_VERSION" ]; then
+            echo "Failed to get juicefs ee version"
+            exit 1
+          fi
+          echo "JUICEFS_EE_LATEST_VERSION=$JUICEFS_EE_LATEST_VERSION" >> $GITHUB_ENV
+
+          echo "mount image is juicedata/mount:ee-$JUICEFS_EE_LATEST_VERSION"
+          echo "MOUNT_IMAGE_EXIST=false" >> $GITHUB_ENV
+          docker pull juicedata/mount:ee-$JUICEFS_EE_LATEST_VERSION
+          rst=$?
+          if [ $rst -eq 0 ]; then
+            echo "MOUNT_IMAGE_EXIST=true" >> $GITHUB_ENV
+          fi
+      - name: Buildx and Push juicefs image
+        env:
+          EEVERSION: ee-${{ env.JUICEFS_EE_LATEST_VERSION }}
+          IMAGE_TAG: ee-${{ env.JUICEFS_EE_LATEST_VERSION }}
+          ACR_TOKEN: ${{ secrets.ACR_TOKEN }}
+          ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
+          JFSPKGURL: ${{ inputs.ee_pkg_url }}
+        run: |
+          mount_image_exist=${{ env.MOUNT_IMAGE_EXIST }}
+          export DOCKER_CLI_EXPERIMENTAL=enabled
+          docker run --privileged --rm tonistiigi/binfmt:qemu-v6.2.0 --uninstall qemu-*
+          docker run --privileged --rm tonistiigi/binfmt:qemu-v6.2.0 --install all
+          docker buildx create --use --name mybuilder
+
+          if [ $mount_image_exist == "false" ]; then
+            echo "Build JuiceFS new version image"
+            make -C docker ee-image-buildx
+          else
+            echo "JuiceFS mount ee version image already exists"
+          fi
+
+      - name: sync image
+        env:
+          IMAGE_TAG: ee-${{ env.JUICEFS_EE_LATEST_VERSION }}
+          ACR_TOKEN: ${{ secrets.ACR_TOKEN }}
+          ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
+        run: |
+          cd ${GITHUB_WORKSPACE}/.github/scripts/
+          ./sync.sh mount ${{ env.IMAGE_TAG }}
+      - name: Setup upterm session
+        if: ${{ failure() }}
+        timeout-minutes: 60
+        uses: lhotari/action-upterm@v1

@@ -19,54 +19,82 @@ package driver
 import (
 	"context"
 	"fmt"
-	csi "github.com/container-storage-interface/spec/lib/go/csi"
-	"github.com/juicedata/juicefs-csi-driver/pkg/juicefs"
+	"path"
+	"reflect"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	"k8s.io/klog"
+	"k8s.io/client-go/util/retry"
+	"k8s.io/klog/v2"
+	k8sexec "k8s.io/utils/exec"
 	"k8s.io/utils/mount"
-	"os"
-	"os/exec"
-	"reflect"
-	"strings"
-)
 
-const (
-	fsTypeNone = "none"
+	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/juicedata/juicefs-csi-driver/pkg/common"
+	"github.com/juicedata/juicefs-csi-driver/pkg/juicefs"
+	"github.com/juicedata/juicefs-csi-driver/pkg/k8sclient"
+	"github.com/juicedata/juicefs-csi-driver/pkg/util"
+	"github.com/juicedata/juicefs-csi-driver/pkg/util/dispatch"
 )
 
 var (
-	nodeCaps = []csi.NodeServiceCapability_RPC_Type{}
+	nodeCaps = []csi.NodeServiceCapability_RPC_Type{csi.NodeServiceCapability_RPC_GET_VOLUME_STATS}
+)
+
+const (
+	defaultCheckTimeout = 2 * time.Second
+	defaultQuotaPoolNum = 4
 )
 
 type nodeService struct {
+	quotaPool *dispatch.Pool
+	csi.UnimplementedNodeServer
+	mount.SafeFormatAndMount
 	juicefs   juicefs.Interface
 	nodeID    string
-	k8sClient juicefs.K8sClient
+	k8sClient *k8sclient.K8sClient
+	metrics   *nodeMetrics
 }
 
-func newNodeService(nodeID string) (*nodeService, error) {
-	jfsProvider, err := juicefs.NewJfsProvider(nil)
-	if err != nil {
-		panic(err)
-	}
+type nodeMetrics struct {
+	volumeErrors    prometheus.Counter
+	volumeDelErrors prometheus.Counter
+}
 
-	stdoutStderr, err := jfsProvider.Version()
-	if err != nil {
-		panic(err)
-	}
-	klog.V(4).Infof("Node: %s", stdoutStderr)
+func newNodeMetrics(reg prometheus.Registerer) *nodeMetrics {
+	metrics := &nodeMetrics{}
+	metrics.volumeErrors = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "volume_errors",
+		Help: "number of volume errors",
+	})
+	reg.MustRegister(metrics.volumeErrors)
+	metrics.volumeDelErrors = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "volume_del_errors",
+		Help: "number of volume delete errors",
+	})
+	reg.MustRegister(metrics.volumeDelErrors)
+	return metrics
+}
 
-	k8sClient, err := juicefs.NewClient()
-	if err != nil {
-		klog.V(5).Infof("Can't get k8s client: %v", err)
-		return nil, err
+func newNodeService(nodeID string, k8sClient *k8sclient.K8sClient, reg prometheus.Registerer) (*nodeService, error) {
+	mounter := &mount.SafeFormatAndMount{
+		Interface: mount.New(""),
+		Exec:      k8sexec.New(),
 	}
-
+	metrics := newNodeMetrics(reg)
+	jfsProvider := juicefs.NewJfsProvider(mounter, k8sClient)
 	return &nodeService{
-		juicefs:   jfsProvider,
-		nodeID:    nodeID,
-		k8sClient: k8sClient,
+		quotaPool:          dispatch.NewPool(defaultQuotaPoolNum),
+		SafeFormatAndMount: *mounter,
+		juicefs:            jfsProvider,
+		nodeID:             nodeID,
+		k8sClient:          k8sClient,
+		metrics:            metrics,
 	}, nil
 }
 
@@ -82,12 +110,18 @@ func (d *nodeService) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstag
 
 // NodePublishVolume is called by the CO when a workload that wants to use the specified volume is placed (scheduled) on a node
 func (d *nodeService) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolumeRequest) (*csi.NodePublishVolumeResponse, error) {
-	// WARNING: debug only, secrets included
-	// klog.V(5).Infof("NodePublishVolume: called with args %+v", req)
-
+	volCtx := req.GetVolumeContext()
+	log := klog.NewKlogr().WithName("NodePublishVolume")
+	if volCtx != nil && volCtx[common.PodInfoName] != "" {
+		log = log.WithValues("appName", volCtx[common.PodInfoName])
+	}
 	volumeID := req.GetVolumeId()
+	log = log.WithValues("volumeId", volumeID)
 
-	klog.V(5).Infof("NodePublishVolume: volume_id is %s", volumeID)
+	ctxWithLog := util.WithLog(ctx, log)
+
+	// WARNING: debug only, secrets included
+	log.V(1).Info("called with args", "args", req)
 
 	target := req.GetTargetPath()
 	if len(target) == 0 {
@@ -98,66 +132,94 @@ func (d *nodeService) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 	if volCap == nil {
 		return nil, status.Error(codes.InvalidArgument, "Volume capability not provided")
 	}
-	klog.V(5).Infof("NodePublishVolume: volume_capability is %s", volCap)
+	log.Info("get volume_capability", "volCap", volCap.String())
 
 	if !isValidVolumeCapabilities([]*csi.VolumeCapability{volCap}) {
 		return nil, status.Error(codes.InvalidArgument, "Volume capability not supported")
 	}
 
-	klog.V(5).Infof("NodePublishVolume: creating dir %s", target)
-	if err := os.MkdirAll(target, os.FileMode(0755)); err != nil {
+	log.Info("creating dir", "target", target)
+	if err := d.juicefs.CreateTarget(ctxWithLog, target); err != nil {
 		return nil, status.Errorf(codes.Internal, "Could not create dir %q: %v", target, err)
 	}
 
-	options := make(map[string]string)
+	options := []string{}
 	if req.GetReadonly() || req.VolumeCapability.AccessMode.GetMode() == csi.VolumeCapability_AccessMode_MULTI_NODE_READER_ONLY {
-		options["ro"] = ""
+		options = append(options, "ro")
 	}
 	if m := volCap.GetMount(); m != nil {
-		for _, f := range m.MountFlags {
-			options[f] = ""
-		}
+		// get mountOptions from PV.spec.mountOptions or StorageClass.mountOptions
+		options = append(options, m.MountFlags...)
 	}
 
-	volCtx := req.GetVolumeContext()
-	klog.V(5).Infof("NodePublishVolume: volume context: %v", volCtx)
+	log.Info("get volume context", "volCtx", volCtx)
 
 	secrets := req.Secrets
 	mountOptions := []string{}
+	// get mountOptions from PV.volumeAttributes or StorageClass.parameters
 	if opts, ok := volCtx["mountOptions"]; ok {
 		mountOptions = strings.Split(opts, ",")
 	}
-	for k, v := range options {
-		if v != "" {
-			k = fmt.Sprintf("%s=%s", k, v)
-		}
-		mountOptions = append(mountOptions, k)
-	}
+	mountOptions = append(mountOptions, options...)
 
-	klog.V(5).Infof("NodePublishVolume: mounting juicefs with secret %+v, options %v", reflect.ValueOf(secrets).MapKeys(), mountOptions)
-	jfs, err := d.juicefs.JfsMount(volumeID, target, secrets, volCtx, mountOptions)
+	log.Info("mounting juicefs", "secret", fmt.Sprintf("%+v", reflect.ValueOf(secrets).MapKeys()), "options", mountOptions)
+	jfs, err := d.juicefs.JfsMount(ctxWithLog, volumeID, target, secrets, volCtx, mountOptions)
 	if err != nil {
+		d.metrics.volumeErrors.Inc()
 		return nil, status.Errorf(codes.Internal, "Could not mount juicefs: %v", err)
 	}
 
-	bindSource, err := jfs.CreateVol(volumeID, volCtx["subPath"])
+	bindSource, err := jfs.CreateVol(ctxWithLog, volumeID, volCtx["subPath"])
 	if err != nil {
+		d.metrics.volumeErrors.Inc()
 		return nil, status.Errorf(codes.Internal, "Could not create volume: %s, %v", volumeID, err)
 	}
 
-	klog.V(5).Infof("NodePublishVolume: binding %s at %s with options %v", bindSource, target, mountOptions)
-	if err := d.juicefs.Mount(bindSource, target, fsTypeNone, []string{"bind"}); err != nil {
-		os.Remove(target)
+	if err := jfs.BindTarget(ctxWithLog, bindSource, target); err != nil {
+		d.metrics.volumeErrors.Inc()
 		return nil, status.Errorf(codes.Internal, "Could not bind %q at %q: %v", bindSource, target, err)
 	}
 
-	klog.V(5).Infof("NodePublishVolume: mounted %s at %s with options %v", volumeID, target, mountOptions)
+	if cap, exist := volCtx["capacity"]; exist {
+		capacity, err := strconv.ParseInt(cap, 10, 64)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "invalid capacity %s: %v", cap, err)
+		}
+		settings := jfs.GetSetting()
+		if settings.PV != nil {
+			capacity = settings.PV.Spec.Capacity.Storage().Value()
+		}
+		quotaPath := settings.SubPath
+		var subdir string
+		for _, o := range settings.Options {
+			pair := strings.Split(o, "=")
+			if len(pair) != 2 {
+				continue
+			}
+			if pair[0] == "subdir" {
+				subdir = path.Join("/", pair[1])
+			}
+		}
+
+		d.quotaPool.Run(context.Background(), func(ctx context.Context) {
+			err := retry.OnError(retry.DefaultRetry, func(err error) bool { return true }, func() error {
+				return d.juicefs.SetQuota(ctx, secrets, settings, path.Join(subdir, quotaPath), capacity)
+			})
+			if err != nil {
+				log.Error(err, "set quota failed")
+			}
+		})
+	}
+
+	log.Info("juicefs volume mounted", "volumeId", volumeID, "target", target)
 	return &csi.NodePublishVolumeResponse{}, nil
 }
 
 // NodeUnpublishVolume is a reverse operation of NodePublishVolume. This RPC is typically called by the CO when the workload using the volume is being moved to a different node, or all the workload using the volume on a node has finished.
 func (d *nodeService) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublishVolumeRequest) (*csi.NodeUnpublishVolumeResponse, error) {
-	klog.V(4).Infof("NodeUnpublishVolume: called with args %+v", req)
+	log := klog.NewKlogr().WithName("NodeUnpublishVolume")
+	ctxWithLog := util.WithLog(ctx, log)
+	log.V(1).Info("called with args", "args", req)
 
 	target := req.GetTargetPath()
 	if len(target) == 0 {
@@ -165,44 +227,12 @@ func (d *nodeService) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpu
 	}
 
 	volumeId := req.GetVolumeId()
-	klog.V(5).Infof("NodeUnpublishVolume: volume_id is %s", volumeId)
+	log.Info("get volume_id", "volumeId", volumeId)
 
-	var corruptedMnt bool
-	exists, err := mount.PathExists(target)
-	if err == nil {
-		if !exists {
-			klog.V(5).Infof("NodeUnpublishVolume: %s target not exists", target)
-			return &csi.NodeUnpublishVolumeResponse{}, nil
-		}
-		var notMnt bool
-		notMnt, err = mount.IsNotMountPoint(d.juicefs, target)
-		if err != nil {
-			return nil, status.Errorf(codes.Internal, "Check target path is mountpoint failed: %q", err)
-		}
-		if notMnt { // target exists but not a mountpoint
-			klog.V(5).Infof("NodeUnpublishVolume: %s target not mounted", target)
-			return &csi.NodeUnpublishVolumeResponse{}, nil
-		}
-	} else if corruptedMnt = mount.IsCorruptedMnt(err); !corruptedMnt {
-		return nil, status.Errorf(codes.Internal, "Check path %s failed: %q", target, err)
-	}
-
-	klog.V(5).Infof("NodeUnpublishVolume: unmounting %s", target)
-	if err = d.juicefs.Unmount(target); err != nil {
-		klog.V(5).Infof("Unmount %s failed: %q, try to lazy unmount", target, err)
-		output, err1 := exec.Command("umount", "-l", target).CombinedOutput()
-		if err1 != nil {
-			return nil, status.Errorf(codes.Internal, "Could not lazy unmount %q: %v, output: %s", target, err1, string(output))
-		}
-	}
-	// Related issue: https://github.com/kubernetes/kubernetes/issues/60987
-	klog.V(5).Infof("NodeUnpublishVolume: remove target %s", target)
-	if err = os.Remove(target); err != nil {
-		klog.V(5).Infof("Remove target directory %s failed: %q", target, err)
-	}
-
-	if err := d.juicefs.DelRefOfMountPod(volumeId, target); err != nil {
-		return &csi.NodeUnpublishVolumeResponse{}, err
+	err := d.juicefs.JfsUnmount(ctxWithLog, volumeId, target)
+	if err != nil {
+		d.metrics.volumeDelErrors.Inc()
+		return nil, status.Errorf(codes.Internal, "Could not unmount %q: %v", target, err)
 	}
 
 	return &csi.NodeUnpublishVolumeResponse{}, nil
@@ -210,7 +240,8 @@ func (d *nodeService) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpu
 
 // NodeGetCapabilities response node capabilities to CO
 func (d *nodeService) NodeGetCapabilities(ctx context.Context, req *csi.NodeGetCapabilitiesRequest) (*csi.NodeGetCapabilitiesResponse, error) {
-	klog.V(4).Infof("NodeGetCapabilities: called with args %+v", req)
+	log := klog.NewKlogr().WithName("NodeGetCapabilities")
+	log.V(1).Info("called with args", "args", req)
 	var caps []*csi.NodeServiceCapability
 	for _, cap := range nodeCaps {
 		c := &csi.NodeServiceCapability{
@@ -227,7 +258,8 @@ func (d *nodeService) NodeGetCapabilities(ctx context.Context, req *csi.NodeGetC
 
 // NodeGetInfo is called by CO for the node at which it wants to place the workload. The result of this call will be used by CO in ControllerPublishVolume.
 func (d *nodeService) NodeGetInfo(ctx context.Context, req *csi.NodeGetInfoRequest) (*csi.NodeGetInfoResponse, error) {
-	klog.V(4).Infof("NodeGetInfo: called with args %+v", req)
+	log := klog.NewKlogr().WithName("NodeGetInfo")
+	log.V(1).Info("called with args", "args", req)
 
 	return &csi.NodeGetInfoResponse{
 		NodeId: d.nodeID,
@@ -240,5 +272,68 @@ func (d *nodeService) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandV
 }
 
 func (d *nodeService) NodeGetVolumeStats(ctx context.Context, req *csi.NodeGetVolumeStatsRequest) (*csi.NodeGetVolumeStatsResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "NodeGetVolumeStats is not implemented yet")
+	log := klog.NewKlogr().WithName("NodeGetVolumeStats")
+	log.V(1).Info("called with args", "args", req)
+
+	volumeID := req.GetVolumeId()
+	if len(volumeID) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "Volume ID not provided")
+	}
+
+	volumePath := req.GetVolumePath()
+	if len(volumePath) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "Volume path not provided")
+	}
+
+	var exists bool
+
+	err := util.DoWithTimeout(ctx, defaultCheckTimeout, func() (err error) {
+		exists, err = mount.PathExists(volumePath)
+		return
+	})
+	if err == nil {
+		if !exists {
+			log.Info("Volume path not exists", "volumePath", volumePath)
+			return nil, status.Error(codes.NotFound, "Volume path not exists")
+		}
+		if d.SafeFormatAndMount.Interface != nil {
+			var notMnt bool
+			err := util.DoWithTimeout(ctx, defaultCheckTimeout, func() (err error) {
+				notMnt, err = mount.IsNotMountPoint(d.SafeFormatAndMount.Interface, volumePath)
+				return err
+			})
+			if err != nil {
+				log.Info("Check volume path is mountpoint failed", "volumePath", volumePath, "error", err)
+				return nil, status.Errorf(codes.Internal, "Check volume path is mountpoint failed: %s", err)
+			}
+			if notMnt { // target exists but not a mountpoint
+				log.Info("volume path not mounted", "volumePath", volumePath)
+				return nil, status.Error(codes.Internal, "Volume path not mounted")
+			}
+		}
+	} else {
+		log.Info("Check volume path %s, err: %s", "volumePath", volumePath, "error", err)
+		return nil, status.Errorf(codes.Internal, "Check volume path, err: %s", err)
+	}
+
+	totalSize, freeSize, totalInodes, freeInodes := util.GetDiskUsage(volumePath)
+	usedSize := int64(totalSize) - int64(freeSize)
+	usedInodes := int64(totalInodes) - int64(freeInodes)
+
+	return &csi.NodeGetVolumeStatsResponse{
+		Usage: []*csi.VolumeUsage{
+			{
+				Available: int64(freeSize),
+				Total:     int64(totalSize),
+				Used:      usedSize,
+				Unit:      csi.VolumeUsage_BYTES,
+			},
+			{
+				Available: int64(freeInodes),
+				Total:     int64(totalInodes),
+				Used:      usedInodes,
+				Unit:      csi.VolumeUsage_INODES,
+			},
+		},
+	}, nil
 }

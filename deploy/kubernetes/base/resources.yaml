@@ -6,7 +6,6 @@ metadata:
   namespace: kube-system
 
 ---
-
 kind: ClusterRole
 apiVersion: rbac.authorization.k8s.io/v1
 metadata:
@@ -14,16 +13,16 @@ metadata:
 rules:
   - apiGroups: [""]
     resources: ["persistentvolumes"]
-    verbs: ["get", "list", "watch", "create", "delete"]
+    verbs: ["get", "list", "watch", "create", "delete", "patch"]
   - apiGroups: [""]
-    resources: ["persistentvolumeclaims"]
-    verbs: ["get", "list", "watch", "update"]
+    resources: ["persistentvolumeclaims", "persistentvolumeclaims/status"]
+    verbs: ["get", "list", "watch", "update", "patch"]
   - apiGroups: ["storage.k8s.io"]
     resources: ["storageclasses"]
     verbs: ["get", "list", "watch"]
   - apiGroups: [""]
     resources: ["events"]
-    verbs: ["get", "list", "watch", "create", "update", "patch"]
+    verbs: ["list", "watch", "create", "update", "patch"]
   - apiGroups: ["storage.k8s.io"]
     resources: ["csinodes"]
     verbs: ["get", "list", "watch"]
@@ -32,13 +31,26 @@ rules:
     verbs: ["get", "list", "watch"]
   - apiGroups: [""]
     resources: ["secrets"]
-    verbs: ["get", "list"]
-  - apiGroups: [""]
-    resources: ["pods"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "create", "update", "patch", "delete", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["endpoints"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: ["apps"]
+    resources: ["daemonsets"]
+    verbs: ["get", "list"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "watch", "list", "delete", "update", "create"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "watch", "list", "delete", "update", "create"]
 ---
-
 kind: ClusterRoleBinding
 apiVersion: rbac.authorization.k8s.io/v1
 metadata:
@@ -117,17 +129,6 @@ rules:
   - apiGroups:
       - ""
     resources:
-      - events
-    verbs:
-      - get
-      - list
-      - watch
-      - create
-      - update
-      - patch
-  - apiGroups:
-      - ""
-    resources:
       - pods
     verbs:
       - get
@@ -137,6 +138,80 @@ rules:
       - delete
       - patch
       - watch
+  - apiGroups:
+      - ""
+    resources:
+      - pods/log
+    verbs:
+      - get
+  - apiGroups:
+      - ""
+    resources:
+      - secrets
+    verbs:
+      - get
+      - create
+      - update
+      - delete
+      - patch
+  - apiGroups:
+      - "batch"
+    resources:
+      - jobs
+    verbs:
+      - get
+      - create
+      - update
+      - delete
+      - patch
+  - apiGroups:
+      - ""
+    resources:
+      - nodes
+    verbs:
+      - get
+      - list
+  - apiGroups:
+      - ""
+    resources:
+      - nodes/proxy
+    verbs:
+      - "*"
+  - apiGroups:
+      - ""
+    resources:
+      - persistentvolumes
+      - persistentvolumeclaims
+    verbs:
+      - get
+      - list
+  - apiGroups:
+      - ""
+    resources:
+      - pods/exec
+    verbs:
+      - create
+  - apiGroups:
+      - ""
+    resources:
+      - events
+    verbs:
+      - create
+      - get
+  - apiGroups:
+      - storage.k8s.io
+    resources:
+      - storageclasses
+    verbs:
+      - get
+      - watch
+  - apiGroups:
+      - ""
+    resources:
+      - configmaps
+    verbs:
+      - get
+      - update
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -151,22 +226,155 @@ subjects:
     name: juicefs-csi-node-sa
     namespace: kube-system
 ---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: juicefs-csi-dashboard-sa
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: juicefs-csi-dashboard-role
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - persistentvolumes
+      - persistentvolumeclaims
+      - persistentvolumeclaims/status
+      - nodes
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - ""
+    resources:
+      - pods
+    verbs:
+      - get
+      - list
+      - watch
+      - update
+  - apiGroups:
+      - storage.k8s.io
+    resources:
+      - storageclasses
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - ""
+    resources:
+      - events
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+  - apiGroups:
+      - ""
+    resources:
+      - pods/log
+    verbs:
+      - get
+  - apiGroups:
+      - batch
+    resources:
+      - jobs
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - delete
+      - update
+  - apiGroups:
+      - ""
+    resources:
+      - nodes/proxy
+    verbs:
+      - "*"
+  - apiGroups:
+      - ""
+    resources:
+      - persistentvolumes
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - coordination.k8s.io
+    resources:
+      - leases
+    verbs:
+      - get
+      - watch
+      - list
+      - delete
+      - update
+      - create
+  - apiGroups:
+      - ""
+    resources:
+      - configmaps
+    verbs:
+      - get
+      - watch
+      - list
+      - delete
+      - update
+      - create
+      - patch
+  - apiGroups:
+      - ""
+    resources:
+      - secrets
+    verbs:
+      - list
+      - get
+  - apiGroups:
+    - ""
+    resources:
+    - pods/exec
+    verbs:
+    - create
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: juicefs-csi-dashboard-rolebinding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: juicefs-csi-dashboard-role
+subjects:
+  - kind: ServiceAccount
+    name: juicefs-csi-dashboard-sa
+    namespace: kube-system
+---
 kind: CSIDriver
-apiVersion: storage.k8s.io/v1beta1
+apiVersion: storage.k8s.io/v1
 metadata:
   name: csi.juicefs.com
 spec:
   attachRequired: false
-  podInfoOnMount: false
+  podInfoOnMount: true
 ---
-apiVersion: scheduling.k8s.io/v1
-kind: PriorityClass
+apiVersion: v1
+kind: ConfigMap
 metadata:
-  name: juicefs-mount-critical
-value: 1000000000
-description: "Juicefs mount pod priority, should not be preempted."
+  name: juicefs-csi-driver-config
+  namespace: kube-system
+data:
+  config.yaml: |-
+    enableNodeSelector: false
+    mountPodPatch:
 ---
-
 kind: StatefulSet
 apiVersion: apps/v1
 metadata:
@@ -179,7 +387,7 @@ spec:
   selector:
     matchLabels:
       app: juicefs-csi-controller
-  replicas: 1
+  replicas: 2
   volumeClaimTemplates: []
   template:
     metadata:
@@ -193,12 +401,13 @@ spec:
           operator: Exists
       containers:
         - name: juicefs-plugin
-          image: juicedata/juicefs-csi-driver:v0.10.4
+          image: juicedata/juicefs-csi-driver:v0.26.3
           args:
             - --endpoint=$(CSI_ENDPOINT)
             - --logtostderr
-            - --nodeid=$(NODE_ID)
-            - --v=5
+            - --nodeid=$(NODE_NAME)
+            - --leader-election
+            - --config=/etc/config/config.yaml
           env:
             - name: CSI_ENDPOINT
               value: unix:///var/lib/csi/sockets/pluginproxy/csi.sock
@@ -218,8 +427,6 @@ spec:
               value: /var/lib/juicefs/volume
             - name: JUICEFS_CONFIG_PATH
               value: /var/lib/juicefs/config
-            - name: JUICEFS_MOUNT_PRIORITY_NAME
-              value: juicefs-mount-critical
           volumeMounts:
             - name: socket-dir
               mountPath: /var/lib/csi/sockets/pluginproxy/
@@ -229,6 +436,11 @@ spec:
             - mountPath: /root/.juicefs
               mountPropagation: Bidirectional
               name: jfs-root-dir
+            - name: webhook-certs
+              mountPath: /etc/webhook/certs
+              readOnly: true
+            - mountPath: /etc/config
+              name: juicefs-config
           ports:
             - name: healthz
               containerPort: 9909
@@ -236,7 +448,7 @@ spec:
           securityContext:
             capabilities:
               add:
-              - SYS_ADMIN
+                - SYS_ADMIN
             privileged: true
           livenessProbe:
             httpGet:
@@ -247,10 +459,11 @@ spec:
             periodSeconds: 10
             failureThreshold: 5
         - name: csi-provisioner
-          image: quay.io/k8scsi/csi-provisioner:v1.6.0
+          image: registry.k8s.io/sig-storage/csi-provisioner:v2.2.2
           args:
             - --csi-address=$(ADDRESS)
             - --timeout=60s
+            - --leader-election
             - --v=5
             # # NOTE: juicefs is not bound to available zones, kind of topology agnostic
             # - --feature-gates=Topology=true
@@ -260,8 +473,21 @@ spec:
           volumeMounts:
             - name: socket-dir
               mountPath: /var/lib/csi/sockets/pluginproxy/
+        - name: csi-resizer
+          image: registry.k8s.io/sig-storage/csi-resizer:v1.9.0
+          args:
+            - --csi-address=$(ADDRESS)
+            - --timeout=20s
+            - --leader-election
+            - --v=2
+          env:
+            - name: ADDRESS
+              value: /var/lib/csi/sockets/pluginproxy/csi.sock
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /var/lib/csi/sockets/pluginproxy/
         - name: liveness-probe
-          image: quay.io/k8scsi/livenessprobe:v1.1.0
+          image: registry.k8s.io/sig-storage/livenessprobe:v2.11.0
           args:
             - --csi-address=$(ADDRESS)
             - --health-port=$(HEALTH_PORT)
@@ -284,6 +510,13 @@ spec:
             path: /var/lib/juicefs/config
             type: DirectoryOrCreate
           name: jfs-root-dir
+        - name: webhook-certs
+          secret:
+            secretName: juicefs-webhook-certs
+        - configMap:
+            defaultMode: 420
+            name: juicefs-csi-driver-config
+          name: juicefs-config
 ---
 # Node Service
 kind: DaemonSet
@@ -312,13 +545,13 @@ spec:
         - name: juicefs-plugin
           securityContext:
             privileged: true
-          image: juicedata/juicefs-csi-driver:v0.10.4
+          image: juicedata/juicefs-csi-driver:v0.26.3
           args:
             - --endpoint=$(CSI_ENDPOINT)
             - --logtostderr
-            - --nodeid=$(NODE_ID)
-            - --v=5
+            - --nodeid=$(NODE_NAME)
             - --enable-manager=true
+            - --config=/etc/config/config.yaml
           env:
             - name: CSI_ENDPOINT
               value: unix:/csi/csi.sock
@@ -334,12 +567,16 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
+            - name: HOST_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            - name: KUBELET_PORT
+              value: "10250"
             - name: JUICEFS_MOUNT_PATH
               value: /var/lib/juicefs/volume
             - name: JUICEFS_CONFIG_PATH
               value: /var/lib/juicefs/config
-            - name: JUICEFS_MOUNT_PRIORITY_NAME
-              value: juicefs-mount-critical
           volumeMounts:
             - name: kubelet-dir
               mountPath: /var/lib/kubelet
@@ -354,6 +591,10 @@ spec:
             - mountPath: /root/.juicefs
               mountPropagation: Bidirectional
               name: jfs-root-dir
+            - mountPath: /etc/config
+              name: juicefs-config
+            - mountPath: /tmp
+              name: jfs-fuse-fd
           ports:
             - name: healthz
               containerPort: 9909
@@ -367,7 +608,7 @@ spec:
             periodSeconds: 10
             failureThreshold: 5
         - name: node-driver-registrar
-          image: quay.io/k8scsi/csi-node-driver-registrar:v1.3.0
+          image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.9.0
           args:
             - --csi-address=$(ADDRESS)
             - --kubelet-registration-path=$(DRIVER_REG_SOCK_PATH)
@@ -383,7 +624,7 @@ spec:
             - name: registration-dir
               mountPath: /registration
         - name: liveness-probe
-          image: quay.io/k8scsi/livenessprobe:v1.1.0
+          image: registry.k8s.io/sig-storage/livenessprobe:v2.11.0
           args:
             - --csi-address=$(ADDRESS)
             - --health-port=$(HEALTH_PORT)
@@ -420,3 +661,190 @@ spec:
             path: /var/lib/juicefs/config
             type: DirectoryOrCreate
           name: jfs-root-dir
+        - configMap:
+            defaultMode: 420
+            name: juicefs-csi-driver-config
+          name: juicefs-config
+        - hostPath:
+            path: /var/run/juicefs-csi
+            type: DirectoryOrCreate
+          name: jfs-fuse-fd
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: juicefs-admission-webhook
+webhooks:
+  - name: sidecar.inject.juicefs.com
+    rules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["pods"]
+    clientConfig:
+      service:
+        namespace: kube-system
+        name: juicefs-admission-webhook
+        path: "/juicefs/inject-v1-pod"
+      caBundle: CA_BUNDLE
+    timeoutSeconds: 20
+    failurePolicy: Fail
+    sideEffects: None
+    admissionReviewVersions: ["v1", "v1beta1"]
+    namespaceSelector:
+      matchLabels:
+        juicefs.com/enable-injection: "true"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: juicefs-admission-serverless-webhook
+webhooks:
+  - name: sidecar.inject.serverless.juicefs.com
+    rules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["pods"]
+    clientConfig:
+      service:
+        namespace: kube-system
+        name: juicefs-admission-webhook
+        path: "/juicefs/serverless/inject-v1-pod"
+      caBundle: CA_BUNDLE
+    timeoutSeconds: 20
+    failurePolicy: Fail
+    sideEffects: None
+    admissionReviewVersions: ["v1", "v1beta1"]
+    namespaceSelector:
+      matchLabels:
+        juicefs.com/enable-serverless-injection: "true"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: juicefs-admission-webhook
+webhooks:
+  - name: validate.secret.juicefs.com
+    matchPolicy: Equivalent
+    objectSelector:
+      matchLabels:
+        juicefs.com/validate-secret: "true"
+    rules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["secrets"]
+    clientConfig:
+      service:
+        namespace: kube-system
+        name: juicefs-admission-webhook
+        path: "/juicefs/validate-secret"
+      caBundle: CA_BUNDLE
+    timeoutSeconds: 5
+    failurePolicy: Ignore
+    sideEffects: None
+    admissionReviewVersions: ["v1"]
+  - name: validate.pv.juicefs.com
+    matchPolicy: Equivalent
+    rules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["persistentvolumes"]
+    clientConfig:
+      service:
+        namespace: kube-system
+        name: juicefs-admission-webhook
+        path: "/juicefs/validate-pv"
+      caBundle: CA_BUNDLE
+    timeoutSeconds: 5
+    failurePolicy: Ignore
+    sideEffects: None
+    admissionReviewVersions: ["v1"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: juicefs-admission-webhook
+  namespace: kube-system
+spec:
+  ports:
+    - name: https-rest
+      port: 443
+      targetPort: 9444
+  selector:
+    app: juicefs-csi-controller
+---
+kind: Secret
+apiVersion: v1
+metadata:
+  name: juicefs-webhook-certs
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/component: webhook-secret
+type: Opaque
+data:
+  ca.crt: CA_BUNDLE
+  tls.crt: TLS_CRT
+  tls.key: TLS_KEY
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app.kubernetes.io/component: dashboard
+  name: juicefs-csi-dashboard
+  namespace: kube-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: juicefs-csi-dashboard
+  template:
+    metadata:
+      labels:
+        app: juicefs-csi-dashboard
+    spec:
+      serviceAccountName: juicefs-csi-dashboard-sa
+      containers:
+        - name: dashboard
+          image: juicedata/csi-dashboard:v0.26.3
+          args:
+            - --static-dir=/dist
+          env:
+            - name: SYS_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: DASHBOARD_IMAGE
+              value: juicedata/csi-dashboard:v0.26.3
+          ports:
+            - containerPort: 8088
+          resources:
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+            requests:
+              cpu: 100m
+              memory: 200Mi
+      tolerations:
+        - key: CriticalAddonsOnly
+          operator: Exists
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: juicefs-csi-dashboard
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/component: dashboard
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8088
+      targetPort: 8088
+      protocol: TCP
+      name: http
+  selector:
+    app: juicefs-csi-dashboard

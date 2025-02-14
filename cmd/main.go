@@ -17,85 +17,123 @@ limitations under the License.
 package main
 
 import (
-	"flag"
+	goflag "flag"
 	"fmt"
-	"github.com/juicedata/juicefs-csi-driver/cmd/apps"
-	"github.com/juicedata/juicefs-csi-driver/pkg/driver"
-	"github.com/juicedata/juicefs-csi-driver/pkg/juicefs"
-	"k8s.io/klog"
+	_ "net/http/pprof"
 	"os"
+	"strings"
+	"time"
+
+	"github.com/spf13/cobra"
+	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
+
+	"github.com/juicedata/juicefs-csi-driver/pkg/config"
+	"github.com/juicedata/juicefs-csi-driver/pkg/driver"
+
+	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
+)
+
+var (
+	endpoint    string
+	version     bool
+	nodeID      string
+	formatInPod bool
+	process     bool
+	configPath  string
+
+	provisioner       bool
+	cacheConf         bool
+	webhook           bool
+	certDir           string
+	webhookPort       int
+	validationWebhook bool
+
+	podManager         bool
+	reconcilerInterval int
+
+	leaderElection              bool
+	leaderElectionNamespace     string
+	leaderElectionLeaseDuration time.Duration
+
+	log = klog.NewKlogr().WithName("main")
 )
 
 func init() {
-	juicefs.NodeName = os.Getenv("NODE_NAME")
-	juicefs.Namespace = os.Getenv("JUICEFS_MOUNT_NAMESPACE")
-	juicefs.PodName = os.Getenv("POD_NAME")
-	juicefs.MountPointPath = os.Getenv("JUICEFS_MOUNT_PATH")
-	juicefs.JFSConfigPath = os.Getenv("JUICEFS_CONFIG_PATH")
-	juicefs.JFSMountPriorityName = os.Getenv("JUICEFS_MOUNT_PRIORITY_NAME")
-	if juicefs.PodName == "" || juicefs.Namespace == "" {
-		klog.Fatalln("Pod name & namespace can't be null.")
-		os.Exit(0)
-	}
-	k8sclient, err := juicefs.NewClient()
-	if err != nil {
-		klog.V(5).Infof("Can't get k8s client: %v", err)
-		os.Exit(0)
-	}
-	pod, err := k8sclient.GetPod(juicefs.PodName, juicefs.Namespace)
-	if err != nil {
-		klog.V(5).Infof("Can't get pod %s: %v", juicefs.PodName, err)
-		os.Exit(0)
-	}
-	for i := range pod.Spec.Containers {
-		if pod.Spec.Containers[i].Name == "juicefs-plugin" {
-			juicefs.MountImage = pod.Spec.Containers[i].Image
-			return
-		}
-	}
-	klog.V(5).Infof("Can't get container juicefs-plugin in pod %s", juicefs.PodName)
-	os.Exit(0)
+	// Initialize a logger for the controller runtime
+	ctrllog.SetLogger(klog.NewKlogr())
+	// To disable controller runtime logging, instead set the null logger:
+	//log.SetLogger(logr.New(log.NullLogSink{}))
 }
 
 func main() {
-	var (
-		endpoint      = flag.String("endpoint", "unix://tmp/csi.sock", "CSI Endpoint")
-		version       = flag.Bool("version", false, "Print the version and exit.")
-		nodeID        = flag.String("nodeid", "", "Node ID")
-		enableManager = flag.Bool("enable-manager", false, "Enable manager or not.")
-	)
-	klog.InitFlags(nil)
-	flag.Parse()
-
-	if *version {
-		info, err := driver.GetVersionJSON()
-		if err != nil {
-			klog.Fatalln(err)
-		}
-		fmt.Println(info)
-		os.Exit(0)
-	}
-
-	if *nodeID == "" {
-		klog.Fatalln("nodeID must be provided")
-	}
-
-	if *enableManager {
-		manager := apps.NewManager()
-		go func() {
-			if err := manager.Start(ctrl.SetupSignalHandler()); err != nil {
-				klog.V(5).Infof("Could not start manager: %v", err)
-				os.Exit(1)
+	var cmd = &cobra.Command{
+		Use:   "juicefs-csi",
+		Short: "juicefs csi driver",
+		Run: func(cmd *cobra.Command, args []string) {
+			if version {
+				info, err := driver.GetVersionJSON()
+				if err != nil {
+					log.Error(err, "fail to get version info")
+					os.Exit(1)
+				}
+				fmt.Println(info)
+				os.Exit(0)
 			}
-		}()
+
+			run()
+		},
+	}
+	cmd.PersistentFlags().StringVar(&endpoint, "endpoint", "unix://tmp/csi.sock", "CSI endpoint")
+	cmd.PersistentFlags().BoolVar(&version, "version", false, "Print the version and exit.")
+	cmd.PersistentFlags().StringVar(&nodeID, "nodeid", "", "Node ID")
+	cmd.PersistentFlags().BoolVar(&formatInPod, "format-in-pod", false, "Put format/auth in pod")
+	cmd.PersistentFlags().BoolVar(&process, "by-process", false, "CSI Driver run juicefs in process or not. default false.")
+	cmd.PersistentFlags().StringVar(&configPath, "config", "", "Paths to a csi config file. default empty")
+
+	cmd.PersistentFlags().BoolVar(&leaderElection, "leader-election", false, "Enables leader election. If leader election is enabled, additional RBAC rules are required. ")
+	cmd.PersistentFlags().StringVar(&leaderElectionNamespace, "leader-election-namespace", "", "Namespace where the leader election resource lives. Defaults to the pod namespace if not set.")
+	cmd.PersistentFlags().DurationVar(&leaderElectionLeaseDuration, "leader-election-lease-duration", 15*time.Second, "Duration, in seconds, that non-leader candidates will wait to force acquire leadership. Defaults to 15 seconds.")
+
+	// controller flags
+	cmd.Flags().BoolVar(&provisioner, "provisioner", false, "Enable provisioner in controller. default false.")
+	cmd.Flags().BoolVar(&cacheConf, "cache-client-conf", false, "Cache client config file. default false.")
+	cmd.Flags().BoolVar(&webhook, "webhook", false, "Enable mutating webhook in controller for sidecar mode. default false.")
+	cmd.Flags().StringVar(&certDir, "webhook-cert-dir", "/etc/webhook/certs", "Admission webhook cert/key dir.")
+	cmd.Flags().IntVar(&webhookPort, "webhook-port", 9444, "Admission webhook port.")
+	cmd.Flags().BoolVar(&validationWebhook, "validating-webhook", false, "Enable validation webhook in controller. default false.")
+
+	// node flags
+	cmd.Flags().BoolVar(&podManager, "enable-manager", false, "Enable pod manager in csi node. default false.")
+	cmd.Flags().IntVar(&reconcilerInterval, "reconciler-interval", 5, "interval (default 5s) for reconciler")
+
+	goFlag := goflag.CommandLine
+	klog.InitFlags(goFlag)
+	cmd.PersistentFlags().AddGoFlagSet(goFlag)
+
+	cmd.AddCommand(upgradeCmd)
+
+	if err := cmd.Execute(); err != nil {
+		os.Exit(1)
+	}
+}
+
+func run() {
+	if configPath != "" {
+		if err := config.StartConfigReloader(configPath); err != nil {
+			log.Error(err, "fail to load config")
+			os.Exit(1)
+		}
 	}
 
-	drv, err := driver.NewDriver(*endpoint, *nodeID)
-	if err != nil {
-		klog.Fatalln(err)
+	ctx := ctrl.SetupSignalHandler()
+	podName := os.Getenv("POD_NAME")
+	if strings.Contains(podName, "csi-controller") {
+		log.Info("Run CSI controller")
+		controllerRun(ctx)
 	}
-	if err := drv.Run(); err != nil {
-		klog.Fatalln(err)
+	if strings.Contains(podName, "csi-node") {
+		log.Info("Run CSI node")
+		nodeRun(ctx)
 	}
 }
